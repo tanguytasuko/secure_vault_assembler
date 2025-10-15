@@ -1,24 +1,28 @@
-; Secure Vault (Credentials manager) — Security++
-; Linux x86-64, NASM, syscalls only
-; Build: nasm -felf64 secure_vault.asm -o secure_vault.o && ld -o secure_vault secure_vault.o
-; Run  : ./secure_vault
+; ============================================================================
+; Secure Vault du T — Gestionnaire d’identifiants (XOR-ECB, clé 8 octets)
+; Linux x86-64, NASM, appels systèmes uniquement
 ;
-; Crypto per spec: XOR with 8-byte repeating key (key = first 8 bytes of password)
-; Hardening in this version:
-;   - **No known-plaintext header** anymore. New header = 16 bytes: [nonce(8)][tag(8)]
-;     where tag = FNV1a-64(key8 || nonce || "SV"), stored *encrypted* like the rest.
-;   - **Immediate authentication** on startup: wrong password => exit right away.
-;   - **Password input hidden** (ECHO off) for master password and entry password.
-;   - **Random padding** for 32-byte fields (login/password) to avoid zero-padding leaks.
-;   - **Memory wipe** (key/password buffers) before exit.
-;   - Backward compatibility:
-;       * Legacy (no header) -> auto-migrate to new 16-byte header.
-;       * Old v1 header (8-byte "SVDBv1") -> auto-migrate to 16-byte header.
+; Renforcements sécurité (v3) :
+;   - En-tête chiffré 16 octets : [nonce(8)][tag(8)]
+;       * tag_v3 = FNV1a64( key8 || nonce || "SV3" )
+;       * rétro-compatibilité : v2 utilisait "SV"
+;   - Sous-clé PAR ENREGISTREMENT (64 o) :
+;       subkey_i = FNV1a64( key8 || nonce || uint64_le(i) )
+;       → Chaque record (64 o) est XOR avec sa sous-clé (répétée sur 8 qwords)
+;   - Authentification immédiate au démarrage ; migration auto v1/v2 → v3
+;   - Saisie de mot de passe masquée ; bourrage aléatoire des champs (32 o)
+;   - Nettoyage mémoire des secrets avant la sortie
 ;
+; Construction :
+;   nasm -felf64 main.asm -o main.o && ld -o secure_vault main.o
+; Exécution :
+;   ./secure_vault
+; ============================================================================
+
 BITS 64
 default rel
 
-; ---- Linux syscalls ----
+; ---- Appels systèmes Linux ----
 %define SYS_read      0
 %define SYS_write     1
 %define SYS_close     3
@@ -28,7 +32,7 @@ default rel
 
 %define AT_FDCWD    -100
 
-; ---- flags / modes (decimal to avoid octal quirks) ----
+; ---- Flags / modes (décimaux) ----
 %define O_RDONLY      0
 %define O_WRONLY      1
 %define O_CREAT      64
@@ -42,64 +46,64 @@ default rel
 %define MAX_DB     65536
 %define REC_SIZE       64
 %define FIELD_SIZE     32
-%define HEAD1_LEN       8      ; old header length ("SVDBv1")
-%define HEAD2_LEN      16      ; new header length: nonce(8) + tag(8)
+%define HEAD1_LEN       8      ; ancien en-tête ("SVDBv1\0")
+%define HEAD2_LEN      16      ; en-tête v2/v3 : nonce(8) + tag(8)
 
 ; ioctl termios
 %define TCGETS     0x5401
 %define TCSETS     0x5402
-%define ECHO_BIT       8       ; bit to clear in c_lflag
+%define ECHO_BIT       8       ; bit ECHO dans c_lflag
 
 section .data
     db_path:        db "vault.db", 0
     urand_path:     db "/dev/urandom", 0
 
-    msg_welcome:    db "Secure Vault (XOR-ECB, key = first 8 bytes)", 10
+    msg_welcome:    db "Secure Vault du T", 10
     len_welcome     equ $-msg_welcome
 
-    msg_pass:       db "Enter DB password: ", 0
-    msg_pass_new:   db "New DB password: ", 0
-    msg_short:      db "Password must be at least 8 characters.", 10
+    msg_pass:       db "Mot de passe de la base : ", 0
+    msg_pass_new:   db "Nouveau mot de passe de la base : ", 0
+    msg_short:      db "Le mot de passe doit faire au moins 8 caracteres.", 10
     len_short       equ $-msg_short
 
-    msg_menu:       db 10, "Choose:", 10, "  1) Add credential", 10, "  2) Show DB", 10, "  3) Quit", 10, "Choice: ", 0
-    msg_login:      db "Login (<=31 chars): ", 0
-    msg_pwd:        db "Password (<=31 chars): ", 0
-    msg_saved:      db "Saved.", 10
+    msg_menu:       db 10, "Choisir :", 10, "  1) Ajouter un identifiant", 10, "  2) Afficher la base", 10, "  3) Quitter", 10, "Choix : ", 0
+    msg_login:      db "Identifiant (<=31 caracteres) : ", 0
+    msg_pwd:        db "Mot de passe (<=31 caracteres) : ", 0
+    msg_saved:      db "Enregistre.", 10
     len_saved       equ $-msg_saved
 
-    msg_db_empty:   db "(DB empty or missing)", 10
+    msg_db_empty:   db "(Base vide ou absente)", 10
     len_db_empty    equ $-msg_db_empty
 
-    msg_bad_choice: db "Invalid choice.", 10
+    msg_bad_choice: db "Choix invalide.", 10
     len_bad_choice  equ $-msg_bad_choice
 
-    msg_db_big:     db "DB too big for buffer.", 10
+    msg_db_big:     db "Base trop grande", 10
     len_db_big      equ $-msg_db_big
 
-    msg_wrong:      db "Wrong password.", 10
+    msg_wrong:      db "Mauvais mot de passe.", 10
     len_wrong       equ $-msg_wrong
 
-    msg_corrupt:    db "Corrupted DB (size mismatch).", 10
+    msg_corrupt:    db "Base corrompue (taille incoherente).", 10
     len_corrupt     equ $-msg_corrupt
 
-    msg_init:       db "Initialized new vault.", 10
+    msg_init:       db "Base init.", 10
     len_init        equ $-msg_init
 
-    msg_migrated:   db "Migrated: authentication enabled.", 10
+    msg_migrated:   db "Migration effectuee : authentification activee.", 10
     len_migrated    equ $-msg_migrated
 
-    lbl_login:      db "Login: ", 0
-    lbl_pass:       db "Password: ", 0
+    lbl_login:      db "Identifiant : ", 0
+    lbl_pass:       db "Mot de passe : ", 0
     sep_line:       db "----------------", 10
     len_sep_line    equ $-sep_line
 
     nl:             db 10
 
-    ; old v1 magic (8 bytes) for backward detection
-    head1_magic:    db "SVDBv1", 0, 0   ; 6 + 2 zeros = 8 bytes
+    ; ancien magic v1 (8 octets) pour detection
+    head1_magic:    db "SVDBv1", 0, 0
 
-    ; FNV-1a 64-bit constants
+    ; Constantes FNV-1a 64 bits
     FNV_OFFSET:     dq 0xcbf29ce484222325
     FNV_PRIME:      dq 0x00000100000001b3
 
@@ -122,14 +126,17 @@ section .bss
 section .text
     global _start
 
+; ----------------------------------------------------------------------------
+; Point d’entrée
+; ----------------------------------------------------------------------------
 _start:
-    ; banner
+    ; bannière
     mov rdi, STDOUT
     mov rsi, msg_welcome
     mov rdx, len_welcome
     call write_all
 
-    ; Check if DB exists to choose prompt text
+    ; Charger la base pour savoir si première exécution
     mov rdi, db_buf
     mov rsi, MAX_DB
     call load_db
@@ -141,9 +148,11 @@ _start:
 .existing:
     mov byte [first_run], 0
 
+; ----------------------------------------------------------------------------
+; Demande du mot de passe de base (masqué)
+; ----------------------------------------------------------------------------
 .prompt_pw:
 .pass_loop:
-    ; prompt (hidden input)
     cmp byte [first_run], 1
     jne .prompt_existing
     mov rdi, msg_pass_new
@@ -155,10 +164,10 @@ _start:
     call disable_echo
     mov rdi, pass_in
     mov rsi, 63
-    call read_line            ; returns length in rax, pass_in NUL-terminated
-    mov rbx, rax              ; SAVE length before printing newline
+    call read_line            ; rax = longueur
+    mov rbx, rax              ; sauver longueur
     call restore_echo
-    ; add a manual newline after hidden input (does not clobber length check)
+    ; retour ligne manuel après saisie masquée
     mov rax, SYS_write
     mov rdi, STDOUT
     mov rsi, nl
@@ -173,7 +182,7 @@ _start:
     call write_all
     jmp .pass_loop
 .have_pw:
-    ; derive key (first 8 bytes)
+    ; clé = 8 premiers octets du mot de passe
     mov rdi, key8
     mov rsi, 8
     call memzero
@@ -182,9 +191,12 @@ _start:
     mov rdx, 8
     call memcpy
 
-    ; authenticate / init / migrate (may exit on wrong password)
+    ; authentifier / initialiser / migrer (sort si mauvais mot de passe)
     call auth_or_init
 
+; ----------------------------------------------------------------------------
+; Menu principal
+; ----------------------------------------------------------------------------
 main_menu:
     mov rdi, msg_menu
     call print_cstr
@@ -192,11 +204,11 @@ main_menu:
     mov rsi, 7
     call read_line
     mov al, [choice_in]
-    cmp al, 49              ; '1'
+    cmp al, '1'
     je do_add
-    cmp al, 50              ; '2'
+    cmp al, '2'
     je do_show
-    cmp al, 51              ; '3'
+    cmp al, '3'
     je exit_ok
     mov rdi, STDOUT
     mov rsi, msg_bad_choice
@@ -204,10 +216,11 @@ main_menu:
     call write_all
     jmp main_menu
 
-; ---- F1: add credential ----
-
+; ----------------------------------------------------------------------------
+; F1 : Ajouter un identifiant
+; ----------------------------------------------------------------------------
 do_add:
-    ; login
+    ; identifiant
     mov rdi, msg_login
     call print_cstr
     mov rdi, login_in
@@ -217,7 +230,7 @@ do_add:
     mov rsi, FIELD_SIZE-1
     call read_line
 
-    ; password (hidden)
+    ; mot de passe (masque)
     mov rdi, msg_pwd
     call print_cstr
     call disable_echo
@@ -228,42 +241,146 @@ do_add:
     mov rsi, FIELD_SIZE-1
     call read_line
     call restore_echo
-    ; newline after hidden input
+    ; retour ligne manuel
     mov rax, SYS_write
     mov rdi, STDOUT
     mov rsi, nl
     mov rdx, 1
     syscall
 
-    ; load DB
+    ; charger la base
     mov rdi, db_buf
     mov rsi, MAX_DB
     call load_db
     mov [db_size], rax
 
-    ; decrypt
+    ; taille minimale pour en-tete
+    cmp qword [db_size], HEAD2_LEN
+    jb .da_small
+
+    ; dechiffrer en-tete uniquement
     mov rdi, db_buf
-    mov rsi, [db_size]
+    mov rsi, HEAD2_LEN
     mov rdx, key8
     call xor_buf
 
-    ; expect HEAD2_LEN header (auth_or_init enforces it)
-    mov rax, [db_size]
-    mov rcx, rax
-    and rcx, 63
-    cmp rcx, HEAD2_LEN
-    jne .da_corrupt
+    ; verifier tag v3
+    mov rdi, key8
+    mov rsi, db_buf          ; ptr nonce
+    call compute_tag3
+    mov r8, [db_buf + 8]
+    cmp rax, r8
+    jne .maybe_v2
+    jmp .ok_hdr
 
-    ; capacity
+.da_small:
+    mov rdi, STDOUT
+    mov rsi, msg_corrupt
+    mov rdx, len_corrupt
+    call write_all
+    jmp main_menu
+
+.maybe_v2:
+    ; essayer tag v2 puis migrer v2 -> v3
+    mov rdi, key8
+    mov rsi, db_buf
+    call compute_tag2
+    mov r8, [db_buf + 8]
+    cmp rax, r8
+    jne .bad_pw
+
+    ; dechiffrer le corps legacy (si >16)
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .no_legacy_body
+    sub rax, HEAD2_LEN
+    mov rsi, rax
+    mov rdi, db_buf + HEAD2_LEN
+    mov rdx, key8
+    call xor_buf
+.no_legacy_body:
+
+    ; re-chiffrer en v3 par enregistrement (borne end_ptr en r8)
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .count_zero_mig
+    sub rax, HEAD2_LEN
+    shr rax, 6
+    jmp .count_set_mig
+.count_zero_mig:
+    xor rax, rax
+.count_set_mig:
+    mov rsi, rax                ; nb records
+    mov rdi, db_buf + HEAD2_LEN ; debut records
+    mov rdx, key8
+    mov rcx, db_buf             ; ptr nonce
+    mov rax, [db_size]
+    lea r8,  [db_buf + rax]     ; end_ptr
+    call records_xor_v3
+
+    ; nouveau tag v3 + re-chiffrer en-tete + sauver
+    mov rdi, key8
+    mov rsi, db_buf
+    call compute_tag3
+    mov [db_buf + 8], rax
+
+    mov rdi, db_buf
+    mov rsi, HEAD2_LEN
+    mov rdx, key8
+    call xor_buf
+
+    mov rdi, db_buf
+    mov rsi, [db_size]
+    call save_db
+    jmp .hdr_reloaded
+
+.bad_pw:
+    mov rdi, STDOUT
+    mov rsi, msg_wrong
+    mov rdx, len_wrong
+    call write_all
+    jmp main_menu
+
+.hdr_reloaded:
+    ; recharger + dechiffrer l’en-tete (v3)
+    mov rdi, db_buf
+    mov rsi, MAX_DB
+    call load_db
+    mov [db_size], rax
+    mov rdi, db_buf
+    mov rsi, HEAD2_LEN
+    mov rdx, key8
+    call xor_buf
+
+.ok_hdr:
+    ; dechiffrer les records (v3) avec end_ptr
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .count_zero_ok
+    sub rax, HEAD2_LEN
+    shr rax, 6
+    jmp .count_set_ok
+.count_zero_ok:
+    xor rax, rax
+.count_set_ok:
+    mov rsi, rax                ; nb records
+    mov rdi, db_buf + HEAD2_LEN
+    mov rdx, key8
+    mov rcx, db_buf
+    mov rax, [db_size]
+    lea r8,  [db_buf + rax]     ; end_ptr
+    call records_xor_v3         ; dechiffre en place
+
+    ; place disponible ?
     mov rax, [db_size]
     add rax, REC_SIZE
     cmp rax, MAX_DB
     ja  .too_big
 
-    ; append record with random padding
+    ; ajouter un enregistrement (clair + bourrage aleatoire)
     mov rbx, [db_size]
 
-    ; login field
+    ; champ identifiant (32)
     lea rdi, [db_buf + rbx]
     mov rsi, FIELD_SIZE
     call fill_random
@@ -272,7 +389,7 @@ do_add:
     mov rdx, FIELD_SIZE
     call copy_cstr
 
-    ; password field
+    ; champ mot de passe (32)
     lea rdi, [db_buf + rbx + FIELD_SIZE]
     mov rsi, FIELD_SIZE
     call fill_random
@@ -284,9 +401,32 @@ do_add:
     add rbx, REC_SIZE
     mov [db_size], rbx
 
-    ; re-encrypt and save
+    ; re-chiffrer les records (v3) avec end_ptr mis a jour
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .count_zero_end
+    sub rax, HEAD2_LEN
+    shr rax, 6
+    jmp .count_set_end
+.count_zero_end:
+    xor rax, rax
+.count_set_end:
+    mov rsi, rax
+    mov rdi, db_buf + HEAD2_LEN
+    mov rdx, key8
+    mov rcx, db_buf
+    mov rax, [db_size]
+    lea r8,  [db_buf + rax]     ; end_ptr
+    call records_xor_v3
+
+    ; tag v3 + (re)chiffrer en-tete + sauvegarde
+    mov rdi, key8
+    mov rsi, db_buf
+    call compute_tag3
+    mov [db_buf + 8], rax
+
     mov rdi, db_buf
-    mov rsi, [db_size]
+    mov rsi, HEAD2_LEN
     mov rdx, key8
     call xor_buf
 
@@ -300,13 +440,6 @@ do_add:
     call write_all
     jmp main_menu
 
-.da_corrupt:
-    mov rdi, STDOUT
-    mov rsi, msg_corrupt
-    mov rdx, len_corrupt
-    call write_all
-    jmp main_menu
-
 .too_big:
     mov rdi, STDOUT
     mov rsi, msg_db_big
@@ -314,8 +447,10 @@ do_add:
     call write_all
     jmp main_menu
 
-; ---- F2: show DB ----
 
+; ----------------------------------------------------------------------------
+; F2 : Afficher la base
+; ----------------------------------------------------------------------------
 do_show:
     mov rdi, db_buf
     mov rsi, MAX_DB
@@ -331,21 +466,43 @@ do_show:
     jmp main_menu
 
 .have:
+    ; taille min en-tete
+    cmp qword [db_size], HEAD2_LEN
+    jb .wrong
+
+    ; dechiffrer l’en-tete
     mov rdi, db_buf
-    mov rsi, [db_size]
+    mov rsi, HEAD2_LEN
     mov rdx, key8
     call xor_buf
 
-    ; verify HEAD2 header tag
-    ; compute tag(key8, nonce)
-    lea rsi, [db_buf]          ; nonce at start
+    ; verifier tag v3
     mov rdi, key8
-    call compute_tag           ; RAX = tag
-    mov r8, [db_buf + 8]       ; stored tag
+    mov rsi, db_buf
+    call compute_tag3
+    mov r8, [db_buf + 8]
     cmp rax, r8
     jne .wrong
 
-    ; iterate records (start after 16-byte header)
+    ; dechiffrer les records (v3) avec end_ptr
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .sh_count_zero
+    sub rax, HEAD2_LEN
+    shr rax, 6
+    jmp .sh_count_set
+.sh_count_zero:
+    xor rax, rax
+.sh_count_set:
+    mov rsi, rax
+    mov rdi, db_buf + HEAD2_LEN
+    mov rdx, key8
+    mov rcx, db_buf
+    mov rax, [db_size]
+    lea r8,  [db_buf + rax]     ; end_ptr
+    call records_xor_v3
+
+    ; iterer les enregistrements en clair
     mov rbx, HEAD2_LEN
 .loop:
     mov rax, [db_size]
@@ -357,20 +514,20 @@ do_show:
     cmp rax, REC_SIZE
     jb .done
 
-    ; --- separator BEFORE each record ---
+    ; separateur AVANT chaque entree
     mov rdi, STDOUT
     mov rsi, sep_line
     mov rdx, len_sep_line
     call write_all
 
-    ; login
+    ; identifiant
     mov rdi, lbl_login
     call print_cstr
     lea rdi, [db_buf + rbx]
     mov rsi, FIELD_SIZE
     call print_field32
 
-    ; password
+    ; mot de passe
     mov rdi, lbl_pass
     call print_cstr
     lea rdi, [db_buf + rbx + FIELD_SIZE]
@@ -390,12 +547,12 @@ do_show:
     call write_all
     jmp main_menu
 
-; ---- authentication / initialization / migration ----
-; New header format (v2): [nonce(8)][tag(8)] where tag = FNV1a64(key8 || nonce || "SV")
-; All bytes stored encrypted by XOR just like the rest of the file.
-; On wrong password => prints and exits.
+
+; ----------------------------------------------------------------------------
+; Authentification / initialisation / migration
+; ----------------------------------------------------------------------------
 auth_or_init:
-    ; We already loaded db into db_buf and db_size in _start for prompt text, but reload to be safe
+    ; recharger par prudence
     mov rdi, db_buf
     mov rsi, MAX_DB
     call load_db
@@ -403,33 +560,31 @@ auth_or_init:
 
     cmp qword [db_size], 0
     jne .have
-    ; new DB -> create v2 header (nonce+tag), encrypt, save
+    ; nouvelle base -> créer en-tête v3
     mov rdi, nonce8
     mov rsi, 8
-    call fill_random                 ; nonce
-    ; write header (plaintext in RAM)
+    call fill_random
+
     mov rdi, db_buf
     mov rsi, nonce8
     mov rdx, 8
-    call memcpy                      ; nonce
-    ; tag = compute_tag(key8, nonce)
-    mov rdi, key8
-    mov rsi, db_buf                  ; nonce just copied
-    call compute_tag                 ; RAX = tag
-    mov [db_buf + 8], rax
+    call memcpy
 
+    mov rdi, key8
+    mov rsi, db_buf
+    call compute_tag3
+    mov [db_buf + 8], rax
     mov qword [db_size], HEAD2_LEN
 
-    ; encrypt + save
+    ; chiffrer l’en-tête et sauver
     mov rdi, db_buf
-    mov rsi, [db_size]
+    mov rsi, HEAD2_LEN
     mov rdx, key8
     call xor_buf
     mov rdi, db_buf
     mov rsi, [db_size]
     call save_db
 
-    ; notify
     mov rdi, STDOUT
     mov rsi, msg_init
     mov rdx, len_init
@@ -437,37 +592,81 @@ auth_or_init:
     ret
 
 .have:
-    ; decrypt existing DB
+    ; taille minimale
+    cmp qword [db_size], HEAD2_LEN
+    jb .bad
+
+    ; déchiffrer en-tête
     mov rdi, db_buf
-    mov rsi, [db_size]
+    mov rsi, HEAD2_LEN
     mov rdx, key8
     call xor_buf
 
-    ; Decide by size % 64
-    mov rax, [db_size]
-    mov rcx, rax
-    and rcx, 63
-    cmp rcx, HEAD2_LEN
-    je .is_v2
-    cmp rcx, HEAD1_LEN
-    je .is_v1
-    cmp rcx, 0
-    je .legacy
-    ; corrupted
-    mov rdi, STDOUT
-    mov rsi, msg_corrupt
-    mov rdx, len_corrupt
-    call write_all
-    jmp exit_ok
-
-.is_v2:
-    ; verify tag
-    lea rsi, [db_buf]       ; nonce
+    ; tenter v3
     mov rdi, key8
-    call compute_tag        ; RAX = tag
+    mov rsi, db_buf
+    call compute_tag3
+    mov r8, [db_buf + 8]
+    cmp rax, r8
+    je .ok
+
+    ; tenter v2 (sinon mot de passe faux)
+    mov rdi, key8
+    mov rsi, db_buf
+    call compute_tag2
     mov r8, [db_buf + 8]
     cmp rax, r8
     jne .bad
+
+    ; déchiffrer corps legacy
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .no_legacy_body2
+    sub rax, HEAD2_LEN
+    mov rsi, rax
+    mov rdi, db_buf + HEAD2_LEN
+    mov rdx, key8
+    call xor_buf
+.no_legacy_body2:
+
+    ; re-chiffrer v3
+    mov rax, [db_size]
+    cmp rax, HEAD2_LEN
+    jbe .ac_count_zero
+    sub rax, HEAD2_LEN
+    shr rax, 6
+    jmp .ac_count_set
+.ac_count_zero:
+    xor rax, rax
+.ac_count_set:
+    mov rsi, rax
+    mov rdi, db_buf + HEAD2_LEN
+    mov rdx, key8
+    mov rcx, db_buf
+    call records_xor_v3
+
+    ; nouveau tag + re-chiffrer en-tête + sauver
+    mov rdi, key8
+    mov rsi, db_buf
+    call compute_tag3
+    mov [db_buf + 8], rax
+
+    mov rdi, db_buf
+    mov rsi, HEAD2_LEN
+    mov rdx, key8
+    call xor_buf
+
+    mov rdi, db_buf
+    mov rsi, [db_size]
+    call save_db
+
+    mov rdi, STDOUT
+    mov rsi, msg_migrated
+    mov rdx, len_migrated
+    call write_all
+    ret
+
+.ok:
     ret
 .bad:
     mov rdi, STDOUT
@@ -476,118 +675,9 @@ auth_or_init:
     call write_all
     jmp exit_ok
 
-.is_v1:
-    ; verify old magic then migrate to v2 (grow by +8)
-    xor rdx, rdx
-.v1chk:
-    cmp rdx, HEAD1_LEN
-    jae .v1_ok
-    mov al, [db_buf + rdx]
-    cmp al, [head1_magic + rdx]
-    jne .bad
-    inc rdx
-    jmp .v1chk
-.v1_ok:
-    ; ensure capacity
-    mov rax, [db_size]
-    add rax, 8
-    cmp rax, MAX_DB
-    ja .too_big
-    ; shift content right by 8 (from end to start)
-    mov rcx, [db_size]
-.v1_shift:
-    cmp rcx, 0
-    je .v1_ins
-    dec rcx
-    mov al, [db_buf + rcx]
-    mov [db_buf + rcx + 8], al
-    jmp .v1_shift
-.v1_ins:
-    ; write new v2 header (nonce+tag)
-    mov rdi, nonce8
-    mov rsi, 8
-    call fill_random
-    mov rdi, db_buf
-    mov rsi, nonce8
-    mov rdx, 8
-    call memcpy
-    mov rdi, key8
-    mov rsi, db_buf
-    call compute_tag
-    mov [db_buf + 8], rax
-    ; update size
-    mov rax, [db_size]
-    add rax, 8
-    mov [db_size], rax
-    ; re-encrypt + save
-    mov rdi, db_buf
-    mov rsi, [db_size]
-    mov rdx, key8
-    call xor_buf
-    mov rdi, db_buf
-    mov rsi, [db_size]
-    call save_db
-    ; notify
-    mov rdi, STDOUT
-    mov rsi, msg_migrated
-    mov rdx, len_migrated
-    call write_all
-    ret
-
-.legacy:
-    ; grow by +16 and add v2 header
-    mov rax, [db_size]
-    add rax, HEAD2_LEN
-    cmp rax, MAX_DB
-    ja .too_big
-    mov rcx, [db_size]
-.leg_shift:
-    cmp rcx, 0
-    je .leg_ins
-    dec rcx
-    mov al, [db_buf + rcx]
-    mov [db_buf + rcx + HEAD2_LEN], al
-    jmp .leg_shift
-.leg_ins:
-    mov rdi, nonce8
-    mov rsi, 8
-    call fill_random
-    mov rdi, db_buf
-    mov rsi, nonce8
-    mov rdx, 8
-    call memcpy
-    mov rdi, key8
-    mov rsi, db_buf
-    call compute_tag
-    mov [db_buf + 8], rax
-    mov rax, [db_size]
-    add rax, HEAD2_LEN
-    mov [db_size], rax
-    ; re-encrypt + save
-    mov rdi, db_buf
-    mov rsi, [db_size]
-    mov rdx, key8
-    call xor_buf
-    mov rdi, db_buf
-    mov rsi, [db_size]
-    call save_db
-    ; notify
-    mov rdi, STDOUT
-    mov rsi, msg_migrated
-    mov rdx, len_migrated
-    call write_all
-    ret
-
-.too_big:
-    mov rdi, STDOUT
-    mov rsi, msg_db_big
-    mov rdx, len_db_big
-    call write_all
-    jmp exit_ok
-
-; ---- helpers ----
-
-; write_all(fd=STDOUT/...) with rsi=buf, rdx=len
+; ----------------------------------------------------------------------------
+; Helpers I/O et mémoire
+; ----------------------------------------------------------------------------
 write_all:
 .wloop:
     mov rax, SYS_write
@@ -602,7 +692,6 @@ write_all:
 .done_w:
     ret
 
-; print_cstr(rdi=ptr to zero-terminated string)
 print_cstr:
     push rdi
     call strlen
@@ -612,7 +701,6 @@ print_cstr:
     call write_all
     ret
 
-; strlen(rdi=ptr) -> rax=len (up to first zero)
 strlen:
     mov rax, rdi
 .sloop:
@@ -624,7 +712,8 @@ strlen:
     sub rax, rdi
     ret
 
-; read_line(rdi=buf, rsi=maxlen_without_nul) -> rax=len, stores 0-terminated
+; lit une ligne (jusqu’à '\n') dans [rdi], max rsi (sans le NUL)
+; renvoie rax = longueur ; écrit un NUL final
 read_line:
     mov r8, rsi
     mov rdx, rsi
@@ -661,7 +750,6 @@ read_line:
     xor rax, rax
     ret
 
-; memzero(rdi=ptr, rsi=len)
 memzero:
     test rsi, rsi
     jz .mz_done
@@ -673,7 +761,6 @@ memzero:
 .mz_done:
     ret
 
-; memcpy(rdi=dst, rsi=src, rdx=len)
 memcpy:
     test rdx, rdx
     jz .mc_done
@@ -687,7 +774,7 @@ memcpy:
 .mc_done:
     ret
 
-; copy_cstr(rdi=dst, rsi=src, rdx=maxlen) -> copies src until NUL or maxlen-1, ensures trailing NUL
+; copie une c-string dans dst (max rdx), garantit NUL final
 copy_cstr:
     test rdx, rdx
     jz .cc_done
@@ -710,7 +797,7 @@ copy_cstr:
 .cc_done:
     ret
 
-; xor_buf(rdi=buf, rsi=len, rdx=key8) — XOR with repeating 8-byte key
+; XOR buffer avec clé 8 octets répétée
 xor_buf:
     test rsi, rsi
     jz .xb_done
@@ -726,7 +813,7 @@ xor_buf:
 .xb_done:
     ret
 
-; fill_random(rdi=buf, rsi=len) -> bytes from /dev/urandom (falls back to zeros)
+; Remplit [rdi..rdi+rsi[ avec /dev/urandom (sinon zéros)
 fill_random:
     push rbx
     push r12
@@ -760,44 +847,209 @@ fill_random:
     pop rbx
     ret
 
-; compute_tag(rdi=key8, rsi=nonce8) -> rax = FNV1a64(key8 || nonce8 || "SV")
-compute_tag:
-    ; rax = offset
+; ----------------------------------------------------------------------------
+; Tags et sous-clés (FNV-1a 64)
+; ----------------------------------------------------------------------------
+; tag v2 = FNV1a64(key8 || nonce || "SV")
+compute_tag2:
     mov rax, [rel FNV_OFFSET]
-    ; fold key8
     xor rcx, rcx
-.ct_k:
+.ct2_k:
     cmp rcx, 8
-    jae .ct_n
-    mov bl, [rdi + rcx]
-    xor al, bl
-    mov rdx, [rel FNV_PRIME]
-    mul rdx
+    jae .ct2_n
+    mov dl, [rdi + rcx]
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
     inc rcx
-    jmp .ct_k
-.ct_n:
+    jmp .ct2_k
+.ct2_n:
     xor rcx, rcx
-.ct_n_loop:
+.ct2_nl:
     cmp rcx, 8
-    jae .ct_c
-    mov bl, [rsi + rcx]
-    xor al, bl
-    mov rdx, [rel FNV_PRIME]
-    mul rdx
+    jae .ct2_c
+    mov dl, [rsi + rcx]
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
     inc rcx
-    jmp .ct_n_loop
-.ct_c:
-    mov bl, 'S'
-    xor al, bl
-    mov rdx, [rel FNV_PRIME]
-    mul rdx
-    mov bl, 'V'
-    xor al, bl
-    mov rdx, [rel FNV_PRIME]
-    mul rdx
+    jmp .ct2_nl
+.ct2_c:
+    mov dl, 'S'
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
+    mov dl, 'V'
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
     ret
 
-; disable_echo / restore_echo for terminal
+; tag v3 = FNV1a64(key8 || nonce || "SV3")
+compute_tag3:
+    mov rax, [rel FNV_OFFSET]
+    xor rcx, rcx
+.ct3_k:
+    cmp rcx, 8
+    jae .ct3_n
+    mov dl, [rdi + rcx]
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
+    inc rcx
+    jmp .ct3_k
+.ct3_n:
+    xor rcx, rcx
+.ct3_nl:
+    cmp rcx, 8
+    jae .ct3_c
+    mov dl, [rsi + rcx]
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
+    inc rcx
+    jmp .ct3_nl
+.ct3_c:
+    mov dl, 'S'
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
+    mov dl, 'V'
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
+    mov dl, '3'
+    xor al, dl
+    mov r9, [rel FNV_PRIME]
+    mul r9
+    ret
+
+; sous-clé 8 o = FNV1a64(key8 || nonce || index_u64_le)
+compute_subkey:
+    mov rax, [rel FNV_OFFSET]
+    ; key8
+    xor rcx, rcx
+.cs_k:
+    cmp rcx, 8
+    jae .cs_n
+    mov dl, [rdi + rcx]
+    xor al, dl
+    mov r8, [rel FNV_PRIME]
+    mul r8
+    inc rcx
+    jmp .cs_k
+.cs_n:
+    xor rcx, rcx
+.cs_nl:
+    cmp rcx, 8
+    jae .cs_i
+    mov dl, [rsi + rcx]
+    xor al, dl
+    mov r8, [rel FNV_PRIME]
+    mul r8
+    inc rcx
+    jmp .cs_nl
+.cs_i:
+    mov r9, rdx           ; index
+    mov rcx, 8
+.cs_il:
+    mov dl, r9b
+    xor al, dl
+    mov r8, [rel FNV_PRIME]
+    mul r8
+    shr r9, 8
+    dec rcx
+    jnz .cs_il
+    ret
+
+; ----------------------------------------------------------------------------
+; Chiffrement/Dechiffrement des enregistrements (v3)
+; ----------------------------------------------------------------------------
+; records_xor_v3(rdi=ptr_records, rsi=nb_records, rdx=key8_ptr, rcx=nonce_ptr, r8=end_ptr)
+; → XOR chaque record de 64 octets avec sa sous-clé (répétée 8x), avec contrôle de bornes
+records_xor_v3:
+    push r12
+    push r13
+    push r11
+    push r10
+    push r15
+
+    mov  r12, rdx              ; key8 ptr
+    mov  r13, rcx              ; nonce ptr
+    mov  r11, rdi              ; base records (db_buf + 16)
+    mov  r15, r8               ; fin valide (db_buf + db_size)
+    xor  r10, r10              ; i = 0
+
+.rx_loop:
+    ; stop si i >= nb_records
+    cmp  r10, rsi
+    jae  .rx_done
+
+    ; 1) Calculer la sous-clé d'abord (compute_subkey clobber r9)
+    mov  rdi, r12              ; key8
+    mov  rsi, r13              ; nonce
+    mov  rdx, r10              ; index i
+    call compute_subkey        ; rax = subkey
+    mov  r8, rax               ; r8 = sous-clé 8 o
+
+    ; 2) Puis calculer l'adresse du record i
+    mov  r9, r10
+    shl  r9, 6                 ; i*64
+    add  r9, r11               ; ptr_record
+
+    ; 3) Contrôle de bornes : (ptr_record + 64) <= end_ptr ?
+    lea  rax, [r9 + 64]
+    cmp  rax, r15
+    ja   .rx_done              ; on arrête si dépasserait
+
+    ; 4) XOR des 8 qwords du record avec la sous-clé
+    mov  rax, [r9 +  0]
+    xor  rax, r8
+    mov  [r9 +  0], rax
+
+    mov  rax, [r9 +  8]
+    xor  rax, r8
+    mov  [r9 +  8], rax
+
+    mov  rax, [r9 + 16]
+    xor  rax, r8
+    mov  [r9 + 16], rax
+
+    mov  rax, [r9 + 24]
+    xor  rax, r8
+    mov  [r9 + 24], rax
+
+    mov  rax, [r9 + 32]
+    xor  rax, r8
+    mov  [r9 + 32], rax
+
+    mov  rax, [r9 + 40]
+    xor  rax, r8
+    mov  [r9 + 40], rax
+
+    mov  rax, [r9 + 48]
+    xor  rax, r8
+    mov  [r9 + 48], rax
+
+    mov  rax, [r9 + 56]
+    xor  rax, r8
+    mov  [r9 + 56], rax
+
+    inc  r10
+    jmp  .rx_loop
+
+.rx_done:
+    pop  r15
+    pop  r10
+    pop  r11
+    pop  r13
+    pop  r12
+    ret
+
+
+; ----------------------------------------------------------------------------
+; Terminal : masquer / restaurer l’echo
+; ----------------------------------------------------------------------------
 disable_echo:
     mov rax, SYS_ioctl
     mov rdi, STDIN
@@ -806,16 +1058,16 @@ disable_echo:
     syscall
     cmp rax, 0
     jl .de_ret
-    ; copy
+    ; copie
     mov rdi, term_new
     mov rsi, term_old
     mov rdx, 64
     call memcpy
-    ; clear ECHO bit in c_lflag (offset 12)
+    ; clear ECHO dans c_lflag (offset 12)
     mov eax, [term_new + 12]
     and eax, ~ECHO_BIT
     mov [term_new + 12], eax
-    ; apply
+    ; appliquer
     mov rax, SYS_ioctl
     mov rdi, STDIN
     mov rsi, TCSETS
@@ -837,7 +1089,9 @@ restore_echo:
 .re_ret:
     ret
 
-; load_db(rdi=buf, rsi=max) -> rax=size
+; ----------------------------------------------------------------------------
+; Fichiers : charger / sauver la base
+; ----------------------------------------------------------------------------
 load_db:
     mov r8, rdi
     mov r9, rsi
@@ -876,7 +1130,6 @@ load_db:
     xor rax, rax
     ret
 
-; save_db(rdi=buf, rsi=size)
 save_db:
     mov r8, rdi
     mov r9, rsi
@@ -897,7 +1150,9 @@ save_db:
 .sv_ret:
     ret
 
-; print_field32(rdi=ptr, rsi=max=32) -> prints bytes until NUL or max, then newline
+; ----------------------------------------------------------------------------
+; Affichage d’un champ 32 octets (jusqu’au NUL), plus saut de ligne
+; ----------------------------------------------------------------------------
 print_field32:
     xor rcx, rcx
 .pf_loop:
@@ -919,11 +1174,11 @@ print_field32:
     syscall
     ret
 
-; zero sensitive memory and exit
+; ----------------------------------------------------------------------------
+; Sortie propre (restaure l’echo, nettoie les secrets)
+; ----------------------------------------------------------------------------
 exit_ok:
-    ; restore echo if needed
     call restore_echo
-    ; wipe secrets
     mov rdi, pass_in
     mov rsi, 64
     call memzero
