@@ -12,7 +12,7 @@ _Par Tanguy Cailleaux et Lorenzo Matilla_
 * Ajoute des paires Identifiant / Mot de passe (32 octets max chacun, bourrage aléatoire).
 * Affiche le contenu après authentification.
 * Nettoie la mémoire sensible à la sortie.
-* Gère la migration auto v1/v2 → v3 du format de base.
+* Gère la migration auto v1/v2 -> v3 du format de base.
 
 ## Comment faire fonctionner
 
@@ -32,7 +32,7 @@ nasm -felf64 main.asm -o main.o && ld -o secure_vault main.o
 ./secure_vault
 ```
 
-* Au premier lancement : saisir un mot de passe de base (≥ 8 caractères).
+* Au premier lancement : saisir un mot de passe de base (>= 8 caractères).
 * Menu :
 
   1. Ajouter un identifiant
