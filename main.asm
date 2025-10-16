@@ -4,14 +4,15 @@
 ;
 ; Renforcements sécurité (v3) :
 ;   - En-tête chiffré 16 octets : [nonce(8)][tag(8)]
-;       * tag_v3 = FNV1a64( key8 || nonce || "SV3" )
-;       * rétro-compatibilité : v2 utilisait "SV"
+;       * tag_v3 = FNV1a64( pw_tagkey8 || nonce || "SV3" )
+;         (pw_tagkey8 = FNV1a64(mot_de_passe_complet))
+;       * rétro-compatibilité : v2 utilisait "SV" avec key8 (8 premiers octets du mot de passe)
 ;   - Sous-clé PAR ENREGISTREMENT (64 o) :
 ;       subkey_i = FNV1a64( key8 || nonce || uint64_le(i) )
 ;       → Chaque record (64 o) est XOR avec sa sous-clé (répétée sur 8 qwords)
 ;   - Authentification immédiate au démarrage ; migration auto v1/v2 → v3
 ;   - Saisie de mot de passe masquée ; bourrage aléatoire des champs (32 o)
-;   - Nettoyage mémoire des secrets avant la sortie
+;   - Nettoyage mémoire des secrets avant la sortie (key8, pw_tagkey8, etc.)
 ;
 ; Construction :
 ;   nasm -felf64 main.asm -o main.o && ld -o secure_vault main.o
@@ -109,6 +110,7 @@ section .data
 
 section .bss
     key8:       resb 8
+    pw_tagkey8: resb 8          ; FNV1a64(pass_in[0..len-1]) pour AUTH v3
     pass_in:    resb 64
     choice_in:  resb 8
     login_in:   resb FIELD_SIZE
@@ -182,7 +184,7 @@ _start:
     call write_all
     jmp .pass_loop
 .have_pw:
-    ; clé = 8 premiers octets du mot de passe
+    ; clé = 8 premiers octets du mot de passe (pour CHIFFREMENT)
     mov rdi, key8
     mov rsi, 8
     call memzero
@@ -190,6 +192,12 @@ _start:
     mov rsi, pass_in
     mov rdx, 8
     call memcpy
+
+    ; pw_tagkey8 = FNV1a64(mot_de_passe_complet) (pour AUTH)
+    mov rdi, pass_in          ; ptr
+    mov rsi, rbx              ; len
+    call compute_fnv64_buf
+    mov [pw_tagkey8], rax
 
     ; authentifier / initialiser / migrer (sort si mauvais mot de passe)
     call auth_or_init
@@ -264,8 +272,8 @@ do_add:
     mov rdx, key8
     call xor_buf
 
-    ; verifier tag v3
-    mov rdi, key8
+    ; verifier tag v3 (avec pw_tagkey8)
+    mov rdi, pw_tagkey8
     mov rsi, db_buf          ; ptr nonce
     call compute_tag3
     mov r8, [db_buf + 8]
@@ -318,8 +326,8 @@ do_add:
     lea r8,  [db_buf + rax]     ; end_ptr
     call records_xor_v3
 
-    ; nouveau tag v3 + re-chiffrer en-tete + sauver
-    mov rdi, key8
+    ; nouveau tag v3 (avec pw_tagkey8) + re-chiffrer en-tete + sauver
+    mov rdi, pw_tagkey8
     mov rsi, db_buf
     call compute_tag3
     mov [db_buf + 8], rax
@@ -419,8 +427,8 @@ do_add:
     lea r8,  [db_buf + rax]     ; end_ptr
     call records_xor_v3
 
-    ; tag v3 + (re)chiffrer en-tete + sauvegarde
-    mov rdi, key8
+    ; tag v3 (avec pw_tagkey8) + (re)chiffrer en-tete + sauvegarde
+    mov rdi, pw_tagkey8
     mov rsi, db_buf
     call compute_tag3
     mov [db_buf + 8], rax
@@ -476,8 +484,8 @@ do_show:
     mov rdx, key8
     call xor_buf
 
-    ; verifier tag v3
-    mov rdi, key8
+    ; verifier tag v3 (avec pw_tagkey8)
+    mov rdi, pw_tagkey8
     mov rsi, db_buf
     call compute_tag3
     mov r8, [db_buf + 8]
@@ -570,7 +578,8 @@ auth_or_init:
     mov rdx, 8
     call memcpy
 
-    mov rdi, key8
+    ; tag v3 avec pw_tagkey8
+    mov rdi, pw_tagkey8
     mov rsi, db_buf
     call compute_tag3
     mov [db_buf + 8], rax
@@ -602,8 +611,8 @@ auth_or_init:
     mov rdx, key8
     call xor_buf
 
-    ; tenter v3
-    mov rdi, key8
+    ; tenter v3 (avec pw_tagkey8)
+    mov rdi, pw_tagkey8
     mov rsi, db_buf
     call compute_tag3
     mov r8, [db_buf + 8]
@@ -645,8 +654,8 @@ auth_or_init:
     mov rcx, db_buf
     call records_xor_v3
 
-    ; nouveau tag + re-chiffrer en-tête + sauver
-    mov rdi, key8
+    ; nouveau tag v3 (pw_tagkey8) + re-chiffrer en-tête + sauver
+    mov rdi, pw_tagkey8
     mov rsi, db_buf
     call compute_tag3
     mov [db_buf + 8], rax
@@ -848,6 +857,25 @@ fill_random:
     ret
 
 ; ----------------------------------------------------------------------------
+; Hash FNV-1a 64 bits d'un buffer (pour pw_tagkey8)
+; compute_fnv64_buf(rdi=ptr, rsi=len) -> rax
+; ----------------------------------------------------------------------------
+compute_fnv64_buf:
+    mov rax, [rel FNV_OFFSET]
+    test rsi, rsi
+    jz .cf_done
+.cf_loop:
+    mov dl, [rdi]
+    xor al, dl
+    mov r8, [rel FNV_PRIME]
+    mul r8
+    inc rdi
+    dec rsi
+    jnz .cf_loop
+.cf_done:
+    ret
+
+; ----------------------------------------------------------------------------
 ; Tags et sous-clés (FNV-1a 64)
 ; ----------------------------------------------------------------------------
 ; tag v2 = FNV1a64(key8 || nonce || "SV")
@@ -885,7 +913,8 @@ compute_tag2:
     mul r9
     ret
 
-; tag v3 = FNV1a64(key8 || nonce || "SV3")
+; tag v3 = FNV1a64(tagkey8 || nonce || "SV3")
+; (tagkey8 = pw_tagkey8 = FNV1a64(mot_de_passe_complet))
 compute_tag3:
     mov rax, [rel FNV_OFFSET]
     xor rcx, rcx
@@ -1046,7 +1075,6 @@ records_xor_v3:
     pop  r12
     ret
 
-
 ; ----------------------------------------------------------------------------
 ; Terminal : masquer / restaurer l’echo
 ; ----------------------------------------------------------------------------
@@ -1183,6 +1211,9 @@ exit_ok:
     mov rsi, 64
     call memzero
     mov rdi, key8
+    mov rsi, 8
+    call memzero
+    mov rdi, pw_tagkey8
     mov rsi, 8
     call memzero
     mov rdi, login_in
