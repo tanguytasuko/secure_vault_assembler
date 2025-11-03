@@ -1,5 +1,5 @@
 ; ============================================================================
-; Secure Vault du T — Gestionnaire d’identifiants (XOR-ECB, clé 8 octets)
+; Secure Vault - Gestionnaire d’identifiants (XOR-ECB, clé 8 octets)
 ; Linux x86-64, NASM, appels systèmes uniquement
 ;
 ; Renforcements sécurité (v3) :
@@ -9,8 +9,8 @@
 ;       * rétro-compatibilité : v2 utilisait "SV" avec key8 (8 premiers octets du mot de passe)
 ;   - Sous-clé PAR ENREGISTREMENT (64 o) :
 ;       subkey_i = FNV1a64( key8 || nonce || uint64_le(i) )
-;       → Chaque record (64 o) est XOR avec sa sous-clé (répétée sur 8 qwords)
-;   - Authentification immédiate au démarrage ; migration auto v1/v2 → v3
+;       -> Chaque record (64 o) est XOR avec sa sous-clé (répétée sur 8 qwords)
+;   - Authentification immédiate au démarrage ; migration auto v1/v2 -> v3
 ;   - Saisie de mot de passe masquée ; bourrage aléatoire des champs (32 o)
 ;   - Nettoyage mémoire des secrets avant la sortie (key8, pw_tagkey8, etc.)
 ;
@@ -59,7 +59,7 @@ section .data
     db_path:        db "vault.db", 0
     urand_path:     db "/dev/urandom", 0
 
-    msg_welcome:    db "Secure Vault du T", 10
+    msg_welcome:    db "Secure Vault", 10
     len_welcome     equ $-msg_welcome
 
     msg_pass:       db "Mot de passe de la base : ", 0
@@ -995,7 +995,7 @@ compute_subkey:
 ; Chiffrement/Dechiffrement des enregistrements (v3)
 ; ----------------------------------------------------------------------------
 ; records_xor_v3(rdi=ptr_records, rsi=nb_records, rdx=key8_ptr, rcx=nonce_ptr, r8=end_ptr)
-; → XOR chaque record de 64 octets avec sa sous-clé (répétée 8x), avec contrôle de bornes
+; -> XOR chaque record de 64 octets avec sa sous-clé (répétée 8x), avec contrôle de bornes
 records_xor_v3:
     push r12
     push r13
